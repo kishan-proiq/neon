@@ -21,43 +21,37 @@ pub(crate) struct Args {
     poll_for_completion: Option<Duration>,
     #[clap(long)]
     limit_to_first_n_targets: Option<usize>,
-    #[clap(
-        long,
-        default_value_t = 32,
-        help = "maximum number of concurrent mgmt API requests (overload protection)"
-    )]
-    max_concurrency: usize,
     targets: Option<Vec<TenantTimelineId>>,
 }
 
 pub(crate) fn main(args: Args) -> anyhow::Result<()> {
-    tracing::info!("[tomo-id-001] pagebench trigger-initial-size starting");
+    // Basic JSON-ish structured logging for CLI runs.
+    // If the wider repo already initializes tracing globally, this is still safe for a standalone command.
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_level(true)
+        .json()
+        .try_init();
+
+    tracing::info!("[tomo-id-001] pagebench trigger_initial_size_calculation starting");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| anyhow::anyhow!("[tomo-id-002] failed to build tokio runtime: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
 
     let main_task = rt.spawn(main_impl(args));
-    let res = rt
-        .block_on(main_task)
-        .map_err(|e| anyhow::anyhow!("[tomo-id-003] main task join failed: {e}"))?;
-
-    tracing::info!("[tomo-id-004] pagebench trigger-initial-size finished");
-    res
+    rt.block_on(main_task)
+        .map_err(|e| anyhow::anyhow!("main task join error: {e}"))?
 }
 
 async fn main_impl(args: Args) -> anyhow::Result<()> {
-    let args: &'static Args = Box::leak(Box::new(args));
-
-    let http_timeout = std::env::var("PAGEBENCH_MGMT_API_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+    let args = Arc::new(args);
 
     let http_client = reqwest::Client::builder()
-        .timeout(http_timeout)
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(8)
         .build()?;
 
     let mgmt_api_client = Arc::new(pageserver_client::mgmt_api::Client::new(
@@ -78,18 +72,18 @@ async fn main_impl(args: Args) -> anyhow::Result<()> {
 
     // kick it off
 
-    let max_concurrency = std::env::var("PAGEBENCH_MAX_CONCURRENCY")
+    let max_in_flight: usize = std::env::var("PAGEBENCH_MAX_IN_FLIGHT")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32);
-    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
 
     let mut js = JoinSet::new();
     for tl in timelines {
         let mgmt_api_client = Arc::clone(&mgmt_api_client);
-        let sem = Arc::clone(&sem);
+        let semaphore = Arc::clone(&semaphore);
         js.spawn(async move {
-            let _permit = sem.acquire_owned().await?;
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
 
             let info = mgmt_api_client
                 .timeline_info(
@@ -97,19 +91,8 @@ async fn main_impl(args: Args) -> anyhow::Result<()> {
                     tl.timeline_id,
                     ForceAwaitLogicalSize::Yes,
                 )
-                .await;
-
-            let mut info = match info {
-                Ok(info) => info,
-                Err(e) => {
-                    tracing::warn!(
-                        tenant_id = %tl.tenant_id,
-                        timeline_id = %tl.timeline_id,
-                        "[tomo-id-005] timeline_info initial call failed: {e}"
-                    );
-                    return Ok::<(), anyhow::Error>(());
-                }
-            };
+                .await
+                .unwrap();
 
             // Polling should not be strictly required here since we await
             // for the initial logical size, however it's possible for the request
@@ -118,35 +101,27 @@ async fn main_impl(args: Args) -> anyhow::Result<()> {
             if let Some(period) = args.poll_for_completion {
                 let mut ticker = tokio::time::interval(period.into());
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut info = info;
                 while !info.current_logical_size_is_accurate {
                     ticker.tick().await;
-                    info = match mgmt_api_client
+                    info = mgmt_api_client
                         .timeline_info(
                             TenantShardId::unsharded(tl.tenant_id),
                             tl.timeline_id,
                             ForceAwaitLogicalSize::Yes,
                         )
                         .await
-                    {
-                        Ok(info) => info,
-                        Err(e) => {
-                            tracing::warn!(
-                                tenant_id = %tl.tenant_id,
-                                timeline_id = %tl.timeline_id,
-                                "[tomo-id-006] timeline_info poll call failed: {e}"
-                            );
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                    };
+                        .unwrap();
                 }
             }
-
-            Ok::<(), anyhow::Error>(())
         });
     }
     while let Some(res) = js.join_next().await {
-        if let Err(e) = res? {
-            tracing::warn!("[tomo-id-007] target task failed: {e}");
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!("[tomo-id-006] join_next task failed", error = %e);
+            }
         }
     }
     Ok(())

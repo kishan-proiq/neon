@@ -12,35 +12,45 @@ impl Stats {
             // Initialize with fixed bounds so that we panic at runtime instead of resizing the histogram,
             // which would skew the benchmark results.
             latency_histo: hdrhistogram::Histogram::new_with_bounds(1, 1_000_000_000, 3)
-                .context("init latency histogram")?,
+                .context("initialize latency histogram")?,
         })
     }
 
     pub(crate) fn new() -> Self {
-        Self::try_new().expect("Stats::new: init latency histogram")
+        // Preserve previous behavior (fail fast) while enabling callers to opt into non-panicking init.
+        Self::try_new().expect("initialize latency histogram")
     }
     pub(crate) fn observe(&mut self, latency: Duration) -> anyhow::Result<()> {
         let micros: u64 = latency
             .as_micros()
             .try_into()
-            .context("latency greater than u64")?;
-        anyhow::ensure!(micros >= 1, "latency must be >= 1us to record");
+            .with_context(|| format!("latency too large for u64 micros: {:?}", latency))?;
         self.latency_histo
             .record(micros)
-            .context("add to histogram")?;
+            .with_context(|| format!("add to histogram (micros={micros})"))?;
         Ok(())
     }
     pub(crate) fn output(&self) -> Output {
-        // Note: histogram values are recorded in microseconds (µs).
-        let latency_percentiles = std::array::from_fn(|idx| {
-            let micros = self
-                .latency_histo
-                .value_at_percentile(LATENCY_PERCENTILES[idx]);
-            Duration::from_micros(micros)
-        });
+        let request_count = self.latency_histo.len();
+
+        let latency_percentiles = if request_count == 0 {
+            [Duration::from_micros(0); 4]
+        } else {
+            std::array::from_fn(|idx| {
+                let micros = self
+                    .latency_histo
+                    .value_at_percentile(LATENCY_PERCENTILES[idx]);
+                Duration::from_micros(micros)
+            })
+        };
+
         Output {
-            request_count: self.latency_histo.len(),
-            latency_mean: Duration::from_micros(self.latency_histo.mean() as u64),
+            request_count,
+            latency_mean: if request_count == 0 {
+                Duration::from_micros(0)
+            } else {
+                Duration::from_micros(self.latency_histo.mean() as u64)
+            },
             latency_percentiles: LatencyPercentiles {
                 latency_percentiles,
             },
@@ -61,11 +71,10 @@ impl Default for Stats {
     }
 }
 
-const LATENCY_PERCENTILES_COUNT: usize = 4;
-const LATENCY_PERCENTILES: [f64; LATENCY_PERCENTILES_COUNT] = [95.0, 99.00, 99.90, 99.99];
+const LATENCY_PERCENTILES: [f64; 4] = [95.0, 99.00, 99.90, 99.99];
 
 struct LatencyPercentiles {
-    latency_percentiles: [Duration; LATENCY_PERCENTILES_COUNT],
+    latency_percentiles: [Duration; LATENCY_PERCENTILES.len()],
 }
 
 impl serde::Serialize for LatencyPercentiles {
@@ -73,6 +82,10 @@ impl serde::Serialize for LatencyPercentiles {
     where
         S: serde::Serializer,
     {
+        // Support note:
+        // - Histogram values are stored in microseconds.
+        // - Percentiles are serialized as human-readable durations for benchmark reports.
+        // - If you see frequent saturation at the upper bound, adjust the histogram bounds in `Stats`.
         use serde::ser::SerializeMap;
         let mut ser = serializer.serialize_map(Some(LATENCY_PERCENTILES.len()))?;
         for (p, v) in LATENCY_PERCENTILES.iter().zip(&self.latency_percentiles) {
