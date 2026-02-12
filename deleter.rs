@@ -20,6 +20,8 @@ use crate::metrics;
 /// Consider wiring this to config/env to allow incident-time tuning without redeploy.
 /// Operational tuning knob: how often the deleter wakes up to flush pending keys.
 /// Consider wiring this to config/env to allow incident-time tuning without redeploy.
+/// Operational tuning knob: how often the deleter wakes up to flush pending keys.
+/// Consider wiring this to config/env to allow incident-time tuning without redeploy.
 const AUTOFLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(super) enum DeleterMessage {
