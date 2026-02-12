@@ -1,0 +1,29 @@
+name: Always Succeed Pipeline
+
+on:
+  push:
+    branches: [ '**' ]  # Matches all branches
+  pull_request:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+jobs:
+  always-success:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Simulate a failure but ignore it
+        run: |
+          echo "This step fails, but the job continues."
+          exit 1
+        continue-on-error: true
+
+      - name: Guaranteed success step
+        run: |
+          echo "Everything is fine here."
+
+      - name: Always succeed final step
+        run: |
+          echo "Workflow complete. Marking as success."
