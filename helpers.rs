@@ -70,6 +70,32 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_overlaps_with() {
+        assert!(overlaps_with(&(1..5), &(4..8)));
+        assert!(!overlaps_with(&(1..5), &(5..8)));
+        assert!(!overlaps_with(&(5..8), &(1..5)));
+    }
+
+    #[test]
+    fn test_fully_contains() {
+        assert!(fully_contains(&(1..10), &(2..3)));
+        assert!(fully_contains(&(1..10), &(1..10)));
+        assert!(!fully_contains(&(2..3), &(1..10)));
+    }
+
+    #[test]
+    fn test_intersect_keyspace_basic() {
+        let ks: CompactionKeySpace<u64> = vec![1..5, 10..20];
+        let out = intersect_keyspace(&ks, &(3..12));
+        assert_eq!(out, vec![3..5, 10..12]);
+    }
+}
+
 pub fn union_to_keyspace<K: Ord>(a: &mut CompactionKeySpace<K>, b: CompactionKeySpace<K>) {
     let x = std::mem::take(a);
     let mut all_ranges_iter = [x.into_iter(), b.into_iter()]
@@ -296,6 +322,8 @@ where
     I: Stream<Item = Result<D, E>>,
     D: CompactionDeltaEntry<'a, K>,
 {
+    // Runbook: https://neon.tech/docs (search: pageserver compaction sizing)
+    // Notes: target_size impacts memory and latency; adjust carefully during incidents.
     // Runbook: https://neon.tech/docs (search: pageserver compaction sizing)
     // Notes: target_size impacts memory and latency; adjust carefully during incidents.
     async_stream::try_stream! {
