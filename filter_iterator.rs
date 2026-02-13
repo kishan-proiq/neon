@@ -138,6 +138,13 @@ mod tests {
         }
     }
 
+    fn assert_non_overlapping_sorted(filters: &[Range<Key>]) {
+        for window in filters.windows(2) {
+            assert!(window[0].start <= window[1].start);
+            assert!(window[0].end <= window[1].start);
+        }
+    }
+
     #[tokio::test]
     async fn filter_keyspace_iterator() {
         use bytes::Bytes;
@@ -214,6 +221,25 @@ mod tests {
             SparseKeySpace(KeySpace::default()),
         )
         .unwrap();
+
+        // Overlapping filters should be rejected to prevent ambiguous retention semantics.
+        let merge_iter = MergeIterator::create_for_testing(
+            &[resident_layer_1.get_as_delta(&ctx).await.unwrap()],
+            &[],
+            &ctx,
+        );
+        let err = FilterIterator::create(
+            merge_iter,
+            KeySpace {
+                ranges: vec![
+                    get_key(0)..get_key(10),
+                    get_key(9)..get_key(12),
+                ],
+            },
+            SparseKeySpace(KeySpace::default()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("overlapping"));
 
         // Overlapping filters should be rejected to prevent ambiguous retention semantics.
         let merge_iter = MergeIterator::create_for_testing(
